@@ -137,6 +137,24 @@ class CPPConversions:
         return ''
 
     @typechecked
+    def constraint_message(self, text: str, args: List[str]) -> str:
+        if not args:
+            return '"{}"'.format(text)
+        return 'fmt::format("{}", {})'.format(text, ', '.join(args))
+
+    @typechecked
+    def constraint_fail_update(self, message: str) -> str:
+        return 'return rsl::to_parameter_result_msg(tl::make_unexpected({}));'.format(
+            message
+        )
+
+    @typechecked
+    def constraint_fail_init(self, message: str) -> str:
+        return 'throw rclcpp::exceptions::InvalidParameterValueException({});'.format(
+            message
+        )
+
+    @typechecked
     def no_code(self, s: Union[None, str]):
         return ''
 

@@ -122,6 +122,11 @@ for param in parameters:
 {%- endif %}
 
             if any_param_updated:
+{%- if update_constraints|length %}
+{%- filter indent(width=16) %}
+{{update_constraints}}
+{%- endfilter %}
+{% endif %}
                 updated_params.stamp_ = self.clock_.now()
                 self.update_internal_params(updated_params)
                 if self.user_callback:
@@ -149,5 +154,8 @@ for param in parameters:
 {{declare_set_dynamic_params}}
 {%- endfilter %}
 {%- endif %}
-
-            self.update_internal_params(updated_params)
+{% if declare_constraints|length %}
+{%- filter indent(width=12) %}
+{{declare_constraints}}
+{%- endfilter %}
+{% endif %}            self.update_internal_params(updated_params)

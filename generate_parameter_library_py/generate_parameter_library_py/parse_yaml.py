@@ -42,6 +42,7 @@ from typing import Any, List, Union
 from yaml.parser import ParserError
 from yaml.scanner import ScannerError
 import os
+import re
 import yaml
 
 from generate_parameter_library_py.cpp_conversions import CPPConversions
@@ -101,6 +102,51 @@ def int_to_integer_str(value: str):
 @typechecked
 def validation_base_name(function_name: str):
     return function_name.replace('<>', '')
+
+
+# Reserved YAML key holding cross-parameter constraints for the enclosing struct
+CONSTRAINTS_KEY = '__constraints'
+
+# Keys allowed alongside the operator inside a single constraint definition
+CONSTRAINT_RESERVED_KEYS = {'description'}
+
+# Built-in cross-parameter relations. These are emitted as inline comparisons,
+# so one operator string serves both C++ and Python.
+BUILTIN_CONSTRAINTS = {
+    'lt': '<',
+    'lt_eq': '<=',
+    'gt': '>',
+    'gt_eq': '>=',
+    'eq': '==',
+    'ne': '!=',
+}
+
+# Relations that require an ordering, and therefore numeric operands
+ORDERING_CONSTRAINTS = {'lt', 'lt_eq', 'gt', 'gt_eq'}
+
+NUMERIC_TYPES = {'int', 'double'}
+EQUALITY_TYPES = NUMERIC_TYPES | {'string', 'bool'}
+
+CONSTRAINT_NAME_PATTERN = re.compile(r'^[a-z][a-z0-9_]*$')
+
+
+@typechecked
+def is_parameter_reference(value: Any):
+    return isinstance(value, str) and value.startswith('$')
+
+
+@typechecked
+def literal_type(value: Any):
+    # bool is checked first because it is a subclass of int in Python
+    if isinstance(value, bool):
+        return 'bool'
+    if isinstance(value, int):
+        return 'int'
+    if isinstance(value, float):
+        return 'double'
+    if isinstance(value, str):
+        return 'string'
+    return None
 
 
 @typechecked
@@ -496,6 +542,103 @@ class ParameterValidation:
         return code
 
 
+class ConstraintOperand:
+    """One side of a cross-parameter constraint: a parameter reference or a literal."""
+
+    @typechecked
+    def __init__(
+        self,
+        conversion,
+        defined_type: str,
+        param_path: Union[None, str] = None,
+        value: Any = None,
+        value_known: bool = True,
+    ):
+        self.conversion = conversion
+        self.defined_type = defined_type
+        self.param_path = param_path
+        self.value = value
+        self.value_known = value_known
+
+    @typechecked
+    def is_reference(self) -> bool:
+        return self.param_path is not None
+
+    @typechecked
+    def code(self) -> str:
+        """The expression used inside the generated condition."""
+        if self.is_reference():
+            return 'updated_params.' + self.param_path
+        func = self.conversion.python_val_to_str_func[str(type(self.value))]
+        return func(self.value)
+
+    @typechecked
+    def describe(self) -> str:
+        """Human readable text for the runtime error message."""
+        if self.is_reference():
+            # the value is substituted at runtime by the format placeholder
+            return self.param_path + ' ({})'
+        if isinstance(self.value, bool):
+            return str(self.value).lower()
+        return str(self.value)
+
+    @typechecked
+    def format_arg(self) -> Union[None, str]:
+        """The argument feeding this operand's placeholder, if it has one."""
+        return self.code() if self.is_reference() else None
+
+
+class ParameterConstraint:
+    """A constraint relating several parameters, checked once per struct."""
+
+    @typechecked
+    def __init__(
+        self,
+        name: str,
+        operator: str,
+        operands: List[ConstraintOperand],
+        description: str,
+        conversion,
+        invalid_effect_func,
+        context: str = '',
+    ):
+        self.name = name
+        self.operator = operator
+        self.operands = operands
+        self.description = description
+        self.conversion = conversion
+        self.invalid_effect_func = invalid_effect_func
+        self.context = context
+
+    @typechecked
+    def condition(self) -> str:
+        lhs, rhs = self.operands
+        return '{} {} {}'.format(
+            lhs.code(), BUILTIN_CONSTRAINTS[self.operator], rhs.code()
+        )
+
+    @typechecked
+    def message(self) -> str:
+        lhs, rhs = self.operands
+        text = "{}Constraint '{}' violated: {} must be {} {}".format(
+            self.context,
+            self.name,
+            lhs.describe(),
+            BUILTIN_CONSTRAINTS[self.operator],
+            rhs.describe(),
+        )
+        args = [op.format_arg() for op in self.operands if op.format_arg()]
+        return self.conversion.constraint_message(text, args)
+
+    def __str__(self):
+        data = {
+            'condition': self.condition(),
+            'invalid_effect': self.invalid_effect_func(self.message()),
+        }
+        j2_template = Template(GenerateCode.templates['parameter_constraint'])
+        return j2_template.render(data, trim_blocks=True)
+
+
 class UpdateParameterBase:
     @typechecked
     def __init__(self, parameter_name: str, code_gen_variable: CodeGenVariableBase):
@@ -885,6 +1028,16 @@ class GenerateCode:
         self.declare_parameter_sets = []
         self.set_stack_params = []
         self.user_validation_file = ''
+        # cross-parameter constraints
+        if language == 'python':
+            self.conversion = PythonConversions()
+        else:
+            self.conversion = CPPConversions()
+        self.declared_param_info = {}
+        self.mapped_param_names = set()
+        self.collected_constraints = []
+        self.update_constraints = []
+        self.declare_constraints = []
 
     def parse(self, yaml_file, validate_header):
         with open(yaml_file) as f:
@@ -903,6 +1056,9 @@ class GenerateCode:
             self.namespace = list(doc.keys())[0]
             self.user_validation_file = validate_header
             self.parse_dict(self.namespace, doc[self.namespace], [])
+            # constraints are resolved in a second pass, because a constraint may
+            # reference a parameter declared later in the file
+            self.resolve_constraints()
 
     def parse_params(self, name, value, nested_name_list):
         (
@@ -943,11 +1099,16 @@ class GenerateCode:
         # Resolve mapped paths for dynamic params; track paths for standard params
         mapped_params = []
         if is_runtime_parameter:
+            self.mapped_param_names.add(param_name)
             mapped_params = get_dynamic_mapped_parameter(
                 param_name, self.declared_param_names
             )
         else:
             self.declared_param_names.add(param_name)
+            self.declared_param_info[param_name] = (
+                code_gen_variable.defined_type,
+                code_gen_variable.default_value,
+            )
 
         if is_runtime_parameter:
             declare_parameter_set = SetRuntimeParameter(param_name, code_gen_variable)
@@ -1009,6 +1170,218 @@ class GenerateCode:
             self.update_parameters.append(update_parameter)
             self.declare_parameter_sets.append(declare_parameter_set)
 
+    @typechecked
+    def collect_constraints(self, scope: str, block: Any):
+        """Validate the shape of a __constraints block and stash it for the second pass."""
+        location = scope[:-1] if scope else self.namespace
+        if not isinstance(block, dict):
+            raise compile_error(
+                "'{}' in {} must be a map of constraint names to definitions.".format(
+                    CONSTRAINTS_KEY, location
+                )
+            )
+
+        seen = {name for _, name, _ in self.collected_constraints}
+        for constraint_name, spec in block.items():
+            if not isinstance(
+                constraint_name, str
+            ) or not CONSTRAINT_NAME_PATTERN.match(constraint_name):
+                raise compile_error(
+                    "Invalid constraint name '{}' in {}. Constraint names must be "
+                    'snake_case and start with a letter.'.format(
+                        constraint_name, location
+                    )
+                )
+            if constraint_name in seen:
+                raise compile_error(
+                    "Duplicate constraint name '{}'. Constraint names must be unique.".format(
+                        constraint_name
+                    )
+                )
+            if not isinstance(spec, dict):
+                raise compile_error(
+                    "Constraint '{}' must be a map containing an operator, "
+                    "e.g. 'lt: [$a, $b]'.".format(constraint_name)
+                )
+            seen.add(constraint_name)
+            self.collected_constraints.append((scope, constraint_name, spec))
+
+    @typechecked
+    def resolve_reference(self, reference: str, scope: str, constraint_name: str):
+        """Resolve a $reference to a declared parameter path."""
+        path = reference[1:]
+        if not path:
+            raise compile_error(
+                "Constraint '{}' has an empty parameter reference '$'.".format(
+                    constraint_name
+                )
+            )
+
+        # relative to the struct holding the constraint first, then from the root
+        candidates = [scope + path, path] if scope else [path]
+        for candidate in candidates:
+            if candidate in self.declared_param_info:
+                return candidate
+
+        for mapped in self.mapped_param_names:
+            if mapped.replace('__map_', '').endswith(path):
+                raise compile_error(
+                    "Constraint '{}' references '{}', which is inside a mapped "
+                    '(__map_) parameter. Constraints cannot reference mapped '
+                    'parameters.'.format(constraint_name, path)
+                )
+
+        raise compile_error(
+            "Constraint '{}' references unknown parameter '{}'. Tried: {}.".format(
+                constraint_name, path, ', '.join(candidates)
+            )
+        )
+
+    @typechecked
+    def build_operand(self, raw: Any, scope: str, constraint_name: str, operator: str):
+        if is_parameter_reference(raw):
+            path = self.resolve_reference(raw, scope, constraint_name)
+            defined_type, default_value = self.declared_param_info[path]
+            self.check_operand_type(defined_type, constraint_name, operator, path)
+            return ConstraintOperand(
+                self.conversion,
+                defined_type,
+                param_path=path,
+                value=default_value,
+                value_known=default_value is not None,
+            )
+
+        defined_type = literal_type(raw)
+        if defined_type is None:
+            raise compile_error(
+                "Constraint '{}' has an unsupported operand '{}'. Operands must be "
+                'a $parameter reference or a scalar literal.'.format(
+                    constraint_name, raw
+                )
+            )
+        self.check_operand_type(defined_type, constraint_name, operator, repr(raw))
+        return ConstraintOperand(self.conversion, defined_type, value=raw)
+
+    @typechecked
+    def check_operand_type(
+        self, defined_type: str, constraint_name: str, operator: str, what: str
+    ):
+        if array_type(defined_type) or is_fixed_type(defined_type):
+            raise compile_error(
+                "Constraint '{}' cannot use '{}': constraints only support scalar "
+                'operands, but it has type {}.'.format(
+                    constraint_name, what, defined_type
+                )
+            )
+        allowed = NUMERIC_TYPES if operator in ORDERING_CONSTRAINTS else EQUALITY_TYPES
+        if defined_type not in allowed:
+            raise compile_error(
+                "Constraint '{}' cannot apply '{}' to '{}' of type {}. Allowed "
+                'types are: {}.'.format(
+                    constraint_name,
+                    operator,
+                    what,
+                    defined_type,
+                    ', '.join(sorted(allowed)),
+                )
+            )
+
+    @typechecked
+    def fold_constraint_defaults(self, constraint_name: str, operator: str, operands):
+        """Reject a constraint that is already violated by the declared defaults."""
+        if not all(op.value_known and op.value is not None for op in operands):
+            return
+        lhs, rhs = (op.value for op in operands)
+        checks = {
+            'lt': lhs < rhs,
+            'lt_eq': lhs <= rhs,
+            'gt': lhs > rhs,
+            'gt_eq': lhs >= rhs,
+            'eq': lhs == rhs,
+            'ne': lhs != rhs,
+        }
+        if not checks[operator]:
+            raise compile_error(
+                "Constraint '{}' is violated by the declared default values: "
+                '{} {} {} is false.'.format(
+                    constraint_name, lhs, BUILTIN_CONSTRAINTS[operator], rhs
+                )
+            )
+
+    @typechecked
+    def resolve_constraints(self) -> None:
+        for scope, constraint_name, spec in self.collected_constraints:
+            description = spec.get('description', '')
+            operators = [k for k in spec if k not in CONSTRAINT_RESERVED_KEYS]
+            if len(operators) != 1:
+                raise compile_error(
+                    "Constraint '{}' must contain exactly one operator, found {}.".format(
+                        constraint_name, len(operators)
+                    )
+                )
+            operator = operators[0]
+            if operator.endswith('<>'):
+                raise compile_error(
+                    "Constraint '{}' uses '{}'. The '<>' suffix is only for "
+                    'per-parameter validators; constraints are not templated.'.format(
+                        constraint_name, operator
+                    )
+                )
+            if operator not in BUILTIN_CONSTRAINTS:
+                raise compile_error(
+                    "Constraint '{}' uses unknown operator '{}'. Supported "
+                    'operators are: {}.'.format(
+                        constraint_name,
+                        operator,
+                        ', '.join(sorted(BUILTIN_CONSTRAINTS)),
+                    )
+                )
+
+            raw_operands = spec[operator]
+            if not isinstance(raw_operands, list) or len(raw_operands) != 2:
+                raise compile_error(
+                    "Constraint '{}' with operator '{}' takes exactly 2 operands, "
+                    'e.g. [$vel_min, $vel_max].'.format(constraint_name, operator)
+                )
+
+            operands = [
+                self.build_operand(raw, scope, constraint_name, operator)
+                for raw in raw_operands
+            ]
+            if not any(op.is_reference() for op in operands):
+                raise compile_error(
+                    "Constraint '{}' does not reference any parameter. At least one "
+                    'operand must be a $reference.'.format(constraint_name)
+                )
+
+            self.fold_constraint_defaults(constraint_name, operator, operands)
+
+            # markdown and rst reuse this parser for documentation only
+            if self.language not in {'cpp', 'python'}:
+                continue
+
+            self.update_constraints.append(
+                ParameterConstraint(
+                    constraint_name,
+                    operator,
+                    operands,
+                    description,
+                    self.conversion,
+                    self.conversion.constraint_fail_update,
+                )
+            )
+            self.declare_constraints.append(
+                ParameterConstraint(
+                    constraint_name,
+                    operator,
+                    operands,
+                    description,
+                    self.conversion,
+                    self.conversion.constraint_fail_init,
+                    'Invalid values set during initialization: ',
+                )
+            )
+
     def parse_dict(self, name, root_map, nested_name):
         if isinstance(root_map, dict) and isinstance(
             next(iter(root_map.values())), dict
@@ -1023,6 +1396,10 @@ class GenerateCode:
             self.stack_struct_tree.add_sub_struct(sub_stack_struct)
             self.stack_struct_tree = sub_stack_struct
             for key in root_map:
+                if key == CONSTRAINTS_KEY:
+                    scope = ''.join(x + '.' for x in (nested_name + [name])[1:])
+                    self.collect_constraints(scope, root_map[key])
+                    continue
                 if isinstance(root_map[key], dict):
                     nested_name.append(name)
                     self.parse_dict(key, root_map[key], nested_name)
@@ -1067,6 +1444,10 @@ class GenerateCode:
                 [str(x) for x in self.update_declare_dynamic_parameter]
             ),
             'set_stack_params': '\n'.join([str(x) for x in self.set_stack_params]),
+            'update_constraints': '\n'.join([str(x) for x in self.update_constraints]),
+            'declare_constraints': '\n'.join(
+                [str(x) for x in self.declare_constraints]
+            ),
             # TODO support removing runtime parameters
             # "remove_dynamic_parameters": "\n".join(
             #     [str(x) for x in self.remove_dynamic_parameter]

@@ -136,6 +136,22 @@ class PythonConversions:
         return ''
 
     @typechecked
+    def constraint_message(self, text: str, args: List[str]) -> str:
+        if not args:
+            return '"{}"'.format(text)
+        return '"{}".format({})'.format(text, ', '.join(args))
+
+    @typechecked
+    def constraint_fail_update(self, message: str) -> str:
+        return 'return SetParametersResult(successful=False, reason={})'.format(message)
+
+    @typechecked
+    def constraint_fail_init(self, message: str) -> str:
+        return 'raise InvalidParameterValueException("constraint", None, {})'.format(
+            message
+        )
+
+    @typechecked
     def no_code(self, s: Union[None, str]):
         return ''
 
