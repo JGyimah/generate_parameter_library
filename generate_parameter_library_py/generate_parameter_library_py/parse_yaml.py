@@ -108,7 +108,7 @@ def validation_base_name(function_name: str):
 CONSTRAINTS_KEY = '__constraints'
 
 # Keys allowed alongside the operator inside a single constraint definition
-CONSTRAINT_RESERVED_KEYS = {'description', 'when', 'require'}
+CONSTRAINT_RESERVED_KEYS = {'description', 'when', 'require', 'describe'}
 
 # Keys forming the conditional (guarded) constraint form
 CONSTRAINT_CONDITIONAL_KEYS = {'when', 'require'}
@@ -680,6 +680,13 @@ class ConstraintCall:
         )
 
     @typechecked
+    def label(self) -> str:
+        """Static text with no placeholders."""
+        return '{}({})'.format(
+            self.function_name, ', '.join(op.label() for op in self.operands)
+        )
+
+    @typechecked
     def evaluate(self) -> Union[None, bool]:
         # an arbitrary predicate cannot be folded at generation time
         return None
@@ -700,11 +707,28 @@ class ConstraintDocumentation:
         description: str,
         require: Union[ConstraintRelation, ConstraintCall],
         guard: Union[None, ConstraintRelation] = None,
+        describe: bool = False,
     ):
         self.name = name
         self.description = description
         self.require = require
         self.guard = guard
+        self.describe = describe
+
+    @typechecked
+    def descriptor_text(self) -> str:
+        """Compact text for the ParameterDescriptor of each parameter read.
+
+        Deliberately terse and free of markup: this lands in
+        additional_constraints, which `ros2 param describe` prints verbatim.
+        """
+        text = self.name + ': '
+        if self.guard is not None:
+            text += 'when ' + self.guard.label() + ', '
+        text += self.require.label()
+        if self.description:
+            text += ' (' + self.description + ')'
+        return text
 
     @typechecked
     def parameter_paths(self) -> List[str]:
@@ -1626,9 +1650,41 @@ class GenerateCode:
         )
 
     @typechecked
+    def apply_descriptor_text(self) -> None:
+        """Append the text of every opt-in constraint to the parameters it reads.
+
+        additional_constraints is user-owned and may hold machine-readable
+        content, so nothing is written unless the constraint asks for it with
+        'describe: true'.
+        """
+        declarations = {
+            declaration.parameter_name: declaration
+            for declaration in self.declare_parameters
+        }
+        for constraint in self.documented_constraints:
+            if not constraint.describe:
+                continue
+            for path in constraint.parameter_paths():
+                declaration = declarations.get(path)
+                if declaration is None:
+                    continue
+                existing = declaration.parameter_additional_constraints
+                declaration.parameter_additional_constraints = (
+                    existing + '\n' + constraint.descriptor_text()
+                    if existing
+                    else constraint.descriptor_text()
+                )
+
+    @typechecked
     def resolve_constraints(self) -> None:
         for scope, constraint_name, spec in self.collected_constraints:
             description = spec.get('description', '')
+            describe = spec.get('describe', False)
+            if not isinstance(describe, bool):
+                raise compile_error(
+                    "Constraint '{}' has a 'describe' of '{}'. It must be true or "
+                    'false.'.format(constraint_name, describe)
+                )
             conditional_keys = CONSTRAINT_CONDITIONAL_KEYS.intersection(spec)
             operators = [k for k in spec if k not in CONSTRAINT_RESERVED_KEYS]
 
@@ -1663,7 +1719,9 @@ class GenerateCode:
             self.fold_constraint_defaults(constraint_name, require, guard)
 
             self.documented_constraints.append(
-                ConstraintDocumentation(constraint_name, description, require, guard)
+                ConstraintDocumentation(
+                    constraint_name, description, require, guard, describe
+                )
             )
 
             # markdown and rst only need the documentation record above
@@ -1691,6 +1749,8 @@ class GenerateCode:
                     guard=guard,
                 )
             )
+
+        self.apply_descriptor_text()
 
         # a custom constraint calls into the user's validation header, so the
         # generated code cannot compile without it

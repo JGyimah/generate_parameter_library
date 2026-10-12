@@ -473,6 +473,26 @@ Constraints cannot reference parameters inside a `__map_` block. See [Mapped par
 Constraints are also written to the generated documentation, under a *Cross-parameter constraints* heading, using the
 `description` of each one. See [Generate markdown documentation](#generate-markdown-documentation).
 
+#### Showing a constraint in `ros2 param describe`
+Add `describe: true` to a constraint and its text is appended to the `additional_constraints` field of the
+`ParameterDescriptor` of every parameter it reads, the guard included.
+
+```yaml
+  __constraints:
+    velocity_ordering:
+      lt: [$vel_min, $vel_max]
+      description: "vel_min must be strictly less than vel_max"
+      describe: true
+```
+
+Both `vel_min` and `vel_max` then report `velocity_ordering: vel_min < vel_max (vel_min must be strictly less than
+vel_max)`.
+
+This is opt-in because `additional_constraints` belongs to you and may hold machine-readable content such as the JSON
+schema suggested above. Nothing is written to it unless a constraint asks. When a parameter already has a value, the
+constraint text is appended after it on a new line, and several constraints on one parameter are listed in the order
+they are declared.
+
 ### Nested structures
 After the top-level key, every subsequent non-leaf key will generate a nested C++ struct. The struct instance will have
 the same name as the key.

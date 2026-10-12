@@ -522,3 +522,164 @@ def test_constraint_reports_every_parameter_it_reads():
         assert constraint.parameter_paths() == ['navigation_mode', 'vel_max']
     finally:
         os.unlink(yaml_file)
+
+
+# A separate schema: vel_min carries machine-readable additional_constraints,
+# which the opt-in must preserve rather than overwrite.
+DESCRIBE_SCHEMA = """to_base:
+  navigation_mode:
+    type: string
+    default_value: "autonomous"
+    validation:
+      one_of<>: [["autonomous", "manual"]]
+  vel_min:
+    type: double
+    default_value: 0.5
+    additional_constraints: "{{ type: 'number' }}"
+    validation:
+      bounds<>: [0.0, 2.0]
+  vel_max:
+    type: double
+    default_value: 1.6
+    validation:
+      bounds<>: [0.5, 3.0]
+
+  __constraints:
+{constraints}
+"""
+
+DESCRIBED = """    velocity_ordering:
+      lt: [$vel_min, $vel_max]
+      description: "vel_min must be strictly less than vel_max"
+      describe: true
+"""
+
+GUARDED_DESCRIBED = """    manual_mode_speed_limit:
+      when:
+        $navigation_mode: "manual"
+      require:
+        lt_eq: [$vel_max, 2.0]
+      describe: true
+"""
+
+
+def generate_describe(constraints, language='cpp'):
+    with tempfile.NamedTemporaryFile(
+        mode='w', suffix='.yaml', delete=False
+    ) as yaml_file:
+        yaml_file.write(DESCRIBE_SCHEMA.format(constraints=constraints))
+        path = yaml_file.name
+    suffix = {'cpp': '.hpp', 'python': '.py', 'markdown': '.md'}[language]
+    with tempfile.NamedTemporaryFile(mode='w', suffix=suffix, delete=False) as out:
+        output_file = out.name
+    try:
+        if language == 'cpp':
+            run_cpp(output_file, path)
+        elif language == 'python':
+            run_python(output_file, path)
+        else:
+            run_docs(path, output_file, 'markdown')
+        with open(output_file) as f:
+            return f.read()
+    finally:
+        os.unlink(path)
+        os.unlink(output_file)
+
+
+def test_describe_is_opt_in():
+    without = generate_describe(DESCRIBED.replace('      describe: true\n', ''))
+    # the constraint is still enforced
+    assert "Constraint 'velocity_ordering' violated" in without
+    # but nothing was added to any descriptor
+    assert 'velocity_ordering: vel_min' not in without
+    assert 'descriptor.additional_constraints = "{ type: \'number\' }";' in without
+
+
+def test_describe_appends_to_every_parameter_the_constraint_reads():
+    code = generate_describe(DESCRIBED)
+    text = 'velocity_ordering: vel_min < vel_max (vel_min must be strictly less than vel_max)'
+    # both operands are read, so both descriptors carry it
+    assert code.count(text) == 2
+
+
+def test_describe_preserves_existing_additional_constraints():
+    code = generate_describe(DESCRIBED)
+    assert (
+        'descriptor.additional_constraints = "{ type: \'number\' }'
+        '\\n    velocity_ordering: vel_min < vel_max' in code
+    )
+
+
+def test_describe_includes_parameters_read_only_by_the_guard():
+    code = generate_describe(GUARDED_DESCRIBED)
+    text = "manual_mode_speed_limit: when navigation_mode == 'manual', vel_max <= 2.0"
+    # navigation_mode appears only in the guard, vel_max only in the requirement
+    assert code.count(text) == 2
+    # vel_min takes no part, so its field keeps only the user's value
+    assert 'descriptor.additional_constraints = "{ type: \'number\' }";' in code
+
+
+def test_describe_reaches_the_python_descriptor():
+    code = generate_describe(DESCRIBED, language='python')
+    ast.parse(code)
+    assert code.count('velocity_ordering: vel_min < vel_max') == 2
+
+
+def test_describe_shows_up_per_parameter_in_markdown():
+    docs = generate_describe(DESCRIBED, language='markdown')
+    assert docs.count('velocity_ordering: vel_min < vel_max') >= 1
+
+
+def test_markdown_hides_additional_constraints_without_validators():
+    """Documents a pre-existing quirk of the parameter_detail template.
+
+    The template only emits the Additional Constraints block when a parameter
+    also has validators, so 'describe: true' on a parameter without any is
+    visible to `ros2 param describe` but not in the generated markdown. The
+    dedicated Cross-parameter constraints section still lists it.
+    """
+    schema = DESCRIBE_SCHEMA.replace(
+        '    validation:\n      bounds<>: [0.0, 2.0]\n', ''
+    )
+    schema = schema.replace('    validation:\n      bounds<>: [0.5, 3.0]\n', '')
+    with tempfile.NamedTemporaryFile(
+        mode='w', suffix='.yaml', delete=False
+    ) as yaml_file:
+        yaml_file.write(schema.format(constraints=DESCRIBED))
+        path = yaml_file.name
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as out:
+        output_file = out.name
+    try:
+        run_docs(path, output_file, 'markdown')
+        with open(output_file) as f:
+            docs = f.read()
+        assert '## Cross-parameter constraints' in docs
+        assert 'velocity_ordering: vel_min < vel_max' not in docs
+    finally:
+        os.unlink(path)
+        os.unlink(output_file)
+
+
+def test_describe_renders_a_custom_constraint_as_a_call():
+    constraints = (
+        '    c:\n      "custom::check": [$vel_min, $vel_max, 0.5]\n'
+        '      describe: true\n'
+    )
+    with tempfile.NamedTemporaryFile(
+        mode='w', suffix='.yaml', delete=False
+    ) as yaml_file:
+        yaml_file.write(DESCRIBE_SCHEMA.format(constraints=constraints))
+        path = yaml_file.name
+    try:
+        gen = GenerateCode('markdown')
+        gen.parse(path, '')
+        (constraint,) = gen.documented_constraints
+        assert constraint.descriptor_text() == 'c: custom::check(vel_min, vel_max, 0.5)'
+    finally:
+        os.unlink(path)
+
+
+def test_describe_must_be_a_boolean():
+    with pytest.raises(YAMLSyntaxError) as excinfo:
+        parse_only('    bad:\n      lt: [$vel_min, $vel_max]\n      describe: "yes"\n')
+    assert 'It must be true or false' in str(excinfo.value)
