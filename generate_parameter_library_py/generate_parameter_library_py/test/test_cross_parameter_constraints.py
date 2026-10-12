@@ -33,6 +33,7 @@ import tempfile
 import pytest
 
 from generate_parameter_library_py.generate_cpp_header import run as run_cpp
+from generate_parameter_library_py.generate_markdown import run as run_docs
 from generate_parameter_library_py.generate_python_module import run as run_python
 from generate_parameter_library_py.parse_yaml import GenerateCode, YAMLSyntaxError
 
@@ -436,5 +437,88 @@ def test_python_rejects_a_namespace_other_than_the_import_alias():
         with pytest.raises(YAMLSyntaxError) as excinfo:
             GenerateCode('python').parse(yaml_file, 'my_project.validators')
         assert "must be qualified with 'custom_validators::'" in str(excinfo.value)
+    finally:
+        os.unlink(yaml_file)
+
+
+def document(constraints, language='markdown'):
+    yaml_file = write_yaml(constraints)
+    suffix = '.md' if language == 'markdown' else '.rst'
+    with tempfile.NamedTemporaryFile(mode='w', suffix=suffix, delete=False) as out:
+        output_file = out.name
+    try:
+        run_docs(yaml_file, output_file, language)
+        with open(output_file) as f:
+            return f.read()
+    finally:
+        os.unlink(yaml_file)
+        os.unlink(output_file)
+
+
+def test_markdown_documents_a_relational_constraint():
+    docs = document(ORDERING)
+    assert '## Cross-parameter constraints' in docs
+    assert '* **velocity_ordering** - `vel_min` must be less than `vel_max`' in docs
+    # the schema author's description is carried through
+    assert 'vel_min must be strictly less than vel_max' in docs
+
+
+def test_markdown_phrases_a_guard_as_a_state_not_a_requirement():
+    docs = document(CONDITIONAL)
+    assert (
+        "when `navigation_mode` is 'manual', `vel_max` must be less than or "
+        'equal to 2.0' in docs
+    )
+    assert 'navigation_mode must be' not in docs
+
+
+def test_markdown_documents_a_custom_constraint():
+    docs = document(CUSTOM)
+    assert (
+        'custom check `my_project::srdf_matches_urdf(navigation_mode, joints, '
+        "0.25)`" in docs
+    )
+
+
+def test_rst_uses_double_backticks_and_its_own_heading():
+    docs = document(ORDERING, language='rst')
+    assert 'Cross-parameter constraints\n~~~' in docs
+    assert '``vel_min`` must be less than ``vel_max``' in docs
+    # the markdown heading form must not leak into the rst output
+    assert '## Cross-parameter' not in docs
+
+
+def test_documentation_omits_the_section_when_there_are_no_constraints():
+    yaml_without = PARAMETERS.format(
+        constraints='', vel_min='0.5', nav_mode='autonomous'
+    ).replace('  __constraints:\n', '')
+    with tempfile.NamedTemporaryFile(
+        mode='w', suffix='.yaml', delete=False
+    ) as yaml_file:
+        yaml_file.write(yaml_without)
+        path = yaml_file.name
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as out:
+        output_file = out.name
+    try:
+        run_docs(path, output_file, 'markdown')
+        with open(output_file) as f:
+            assert 'Cross-parameter constraints' not in f.read()
+    finally:
+        os.unlink(path)
+        os.unlink(output_file)
+
+
+def test_documentation_target_needs_no_validation_header_for_custom_checks():
+    # the cpp and python targets require one, documentation does not
+    assert 'custom check' in document(CUSTOM)
+
+
+def test_constraint_reports_every_parameter_it_reads():
+    yaml_file = write_yaml(CONDITIONAL)
+    try:
+        gen = GenerateCode('markdown')
+        gen.parse(yaml_file, '')
+        (constraint,) = gen.documented_constraints
+        assert constraint.parameter_paths() == ['navigation_mode', 'vel_max']
     finally:
         os.unlink(yaml_file)

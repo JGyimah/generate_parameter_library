@@ -470,6 +470,9 @@ folded when the guard is active at the defaults, since an inactive guard makes t
 
 Constraints cannot reference parameters inside a `__map_` block. See [Mapped parameters](#mapped-parameters).
 
+Constraints are also written to the generated documentation, under a *Cross-parameter constraints* heading, using the
+`description` of each one. See [Generate markdown documentation](#generate-markdown-documentation).
+
 ### Nested structures
 After the top-level key, every subsequent non-leaf key will generate a nested C++ struct. The struct instance will have
 the same name as the key.

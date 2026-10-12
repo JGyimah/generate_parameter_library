@@ -685,6 +685,39 @@ class ConstraintCall:
         return None
 
 
+class ConstraintDocumentation:
+    """A resolved constraint, kept for the documentation generators.
+
+    The wording lives in generate_markdown, so this only carries the parsed
+    pieces: the requirement, the guard it sits behind, and the prose the
+    schema author wrote.
+    """
+
+    @typechecked
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        require: Union[ConstraintRelation, ConstraintCall],
+        guard: Union[None, ConstraintRelation] = None,
+    ):
+        self.name = name
+        self.description = description
+        self.require = require
+        self.guard = guard
+
+    @typechecked
+    def parameter_paths(self) -> List[str]:
+        """Every parameter this constraint reads, guard included."""
+        relations = [self.require] if self.guard is None else [self.guard, self.require]
+        paths = []
+        for relation in relations:
+            for operand in relation.operands:
+                if operand.is_reference() and operand.param_path not in paths:
+                    paths.append(operand.param_path)
+        return paths
+
+
 class ParameterConstraint:
     """A constraint relating several parameters, checked once per struct.
 
@@ -1147,6 +1180,7 @@ class GenerateCode:
         self.collected_constraints = []
         self.update_constraints = []
         self.declare_constraints = []
+        self.documented_constraints = []
         self.custom_constraints_used = False
 
     def parse(self, yaml_file, validate_header):
@@ -1628,7 +1662,11 @@ class GenerateCode:
 
             self.fold_constraint_defaults(constraint_name, require, guard)
 
-            # markdown and rst reuse this parser for documentation only
+            self.documented_constraints.append(
+                ConstraintDocumentation(constraint_name, description, require, guard)
+            )
+
+            # markdown and rst only need the documentation record above
             if self.language not in {'cpp', 'python'}:
                 continue
 

@@ -1,5 +1,9 @@
 # {{title}} Parameters
 
 {{default_config}}
+{% if constraints|length %}
+## Cross-parameter constraints
 
+{{constraints}}
+{% endif %}
 {{parameter_details}}

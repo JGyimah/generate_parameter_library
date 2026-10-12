@@ -38,6 +38,9 @@ import yaml
 
 from generate_parameter_library_py.parse_yaml import (
     GenerateCode,
+    ConstraintCall,
+    ConstraintDocumentation,
+    ConstraintRelation,
     DeclareParameter,
     DeclareRuntimeParameter,
     ValidationFunction,
@@ -90,6 +93,78 @@ class ParameterValidationMarkdown:
             validation += ': ' + self.format_arguments(arguments)
 
         return ' - ' + validation
+
+
+class ParameterConstraintMarkdown:
+    """Renders one cross-parameter constraint as a prose bullet."""
+
+    @typechecked
+    def __init__(self, constraint: ConstraintDocumentation, language: str):
+        self.relation_sentences = {
+            'lt': 'must be less than',
+            'gt': 'must be greater than',
+            'lt_eq': 'must be less than or equal to',
+            'gt_eq': 'must be greater than or equal to',
+            'eq': 'must be equal to',
+            'ne': 'must not be equal to',
+        }
+        # a guard describes a state rather than a requirement
+        self.guard_sentences = {
+            'lt': 'is less than',
+            'gt': 'is greater than',
+            'lt_eq': 'is less than or equal to',
+            'gt_eq': 'is greater than or equal to',
+            'eq': 'is',
+            'ne': 'is not',
+        }
+        # rst marks inline literals with a double backtick
+        self.quote = '``' if language == 'rst' else '`'
+        self.constraint = constraint
+
+    @typechecked
+    def quoted(self, text: str) -> str:
+        return self.quote + text + self.quote
+
+    @typechecked
+    def operand(self, operand) -> str:
+        if operand.is_reference():
+            return self.quoted(operand.param_path)
+        return operand.label()
+
+    @typechecked
+    def relation_text(self, relation: ConstraintRelation, guard: bool = False) -> str:
+        left, right = relation.operands
+        wording = self.guard_sentences if guard else self.relation_sentences
+        return '{} {} {}'.format(
+            self.operand(left), wording[relation.operator], self.operand(right)
+        )
+
+    @typechecked
+    def requirement_text(self) -> str:
+        require = self.constraint.require
+        if isinstance(require, ConstraintCall):
+            arguments = ', '.join(
+                operand.param_path if operand.is_reference() else operand.label()
+                for operand in require.operands
+            )
+            return 'custom check {}'.format(
+                self.quoted('{}({})'.format(require.function_name, arguments))
+            )
+        return self.relation_text(require)
+
+    @typechecked
+    def guard_text(self) -> str:
+        if self.constraint.guard is None:
+            return ''
+        return 'when {}, '.format(self.relation_text(self.constraint.guard, guard=True))
+
+    def __str__(self):
+        bullet = '* **{}** - {}{}'.format(
+            self.constraint.name, self.guard_text(), self.requirement_text()
+        )
+        if self.constraint.description:
+            bullet += '\n\n  ' + self.constraint.description
+        return bullet
 
 
 class ParameterDetailMarkdown:
@@ -246,6 +321,10 @@ class AutoDocumentation:
             RuntimeParameterDetailMarkdown(param)
             for param in self.gen_param_struct.declare_dynamic_parameters
         ]
+        self.constraints = [
+            ParameterConstraintMarkdown(constraint, gen_param_struct.language)
+            for constraint in self.gen_param_struct.documented_constraints
+        ]
 
     def __str__(self):
         words = self.gen_param_struct.namespace.split('_')
@@ -254,6 +333,7 @@ class AutoDocumentation:
         data = {
             'title': title,
             'default_config': str(self.default_config),
+            'constraints': '\n\n'.join(str(val) for val in self.constraints),
             'parameter_details': '\n'.join(str(val) for val in self.param_details)
             + '\n'
             + '\n'.join(str(val) for val in self.runtime_param_details),
