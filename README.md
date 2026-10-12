@@ -159,6 +159,7 @@ when using `gmock` test library.
 * [Parameter definition](#parameter-definition)
 * [Built-In Validators](#built-in-validators)
 * [Custom validator functions](#custom-validator-functions)
+* [Cross-parameter constraints](#cross-parameter-constraints)
 * [Nested structures](#nested-structures)
 * [Mapped parameters](#mapped-parameters)
 * [Use generated struct in Cpp](#use-generated-struct-in-cpp)
@@ -333,6 +334,141 @@ To configure a parameter to be validated with the custom validator function `int
 validation:
   "my_project::integer_equal_value": [3]
 ```
+
+### Cross-parameter constraints
+Validators run on one parameter at a time: a validator receives a single `rclcpp::Parameter` and cannot see any other
+parameter. An invariant that relates two parameters, such as a minimum velocity that must stay below a maximum, therefore
+cannot be expressed as a validator.
+
+Use the reserved `__constraints` key for these. It holds named constraints over the parameters of the struct it appears
+in, and may appear at any nesting level.
+
+```yaml
+to_base:
+  vel_min:
+    type: double
+    default_value: 0.5
+  vel_max:
+    type: double
+    default_value: 1.6
+
+  __constraints:
+    velocity_ordering:
+      lt: [$vel_min, $vel_max]
+      description: "vel_min must be strictly less than vel_max"
+```
+
+Each entry is named, and the name appears in the error message reported to the caller and must be unique and snake_case.
+Operands are either a `$reference` to a declared parameter or a scalar literal. The `$` is required: it keeps a reference
+distinct from a string literal, which matters when the parameter being compared is itself a string.
+
+A reference is a dotted path resolved relative to the struct holding the `__constraints` block, falling back to the root
+of the file. From inside a `pid` struct, `$rate` finds `pid.rate` if it exists and the top-level `rate` otherwise.
+
+**Built-in relations**
+| Function | Operands              | Description   |
+| -------- | --------------------- | ------------- |
+| lt       | [left, right]         | left < right  |
+| gt       | [left, right]         | left > right  |
+| lt_eq    | [left, right]         | left <= right |
+| gt_eq    | [left, right]         | left >= right |
+| eq       | [left, right]         | left == right |
+| ne       | [left, right]         | left != right |
+
+The ordering relations require numeric operands; `eq` and `ne` also accept strings and bools. Operands must be scalars,
+and unlike validators these functions take no `<>` suffix, because a constraint has no single parameter type to
+substitute.
+
+#### Conditional constraints
+A requirement that only applies while another parameter holds a particular value is written with `when` and `require`.
+
+```yaml
+  __constraints:
+    manual_mode_speed_limit:
+      when:
+        eq: [$navigation_mode, "manual"]
+      require:
+        lt_eq: [$vel_max, 2.0]
+      description: "in manual mode, vel_max must not exceed 2.0"
+```
+
+Equality guards are the common case, so `when: {$navigation_mode: "manual"}` is accepted as shorthand for the `eq` form
+above. The guard is named in the error message, so the reason the limit applied is visible to the caller:
+
+```
+Constraint 'manual_mode_speed_limit' violated: with navigation_mode == 'manual', vel_max (2.5) must be <= 2.0
+```
+
+Both `when` and `require` take the built-in relations above. A guard must be a built-in relation; a custom function
+cannot be used as one.
+
+#### Custom constraint functions
+A predicate that needs parsing, iteration or a lookup is written as a function, named in place of the operator and
+fully qualified.
+
+```yaml
+  __constraints:
+    srdf_matches_urdf:
+      "my_project::srdf_matches_urdf": [$urdf, $srdf]
+      description: "the srdf must describe the same joints as the urdf"
+```
+
+The function returns `tl::expected<void, std::string>` like a validator, but receives the referenced values
+positionally, in the order listed, rather than an `rclcpp::Parameter`.
+
+```c++
+tl::expected<void, std::string> srdf_matches_urdf(
+    std::string const& urdf, std::string const& srdf) {
+  // ...
+  return {};
+}
+```
+
+The order of `params` is part of the function's signature, so keep the two in step. Unlike the built-in relations, a
+referenced parameter may be of any type, including arrays, since inspecting a collection is usually the point. A literal
+operand must still be a scalar. The function lives in the header passed as the third argument to
+`generate_parameter_library()`, the same one used for custom validators. For python targets the function must be
+qualified with `custom_validators::`, which is the alias the generated module imports that file under.
+
+#### When constraints are checked
+Constraints are checked at two points, after every per-parameter validator has passed:
+
+* in `declare_params()`, when the `ParamListener` is constructed and the defaults, YAML config files and command-line
+  overrides have been merged. A violation throws `rclcpp::exceptions::InvalidParameterValueException`, so the node fails
+  to construct.
+* in the parameter update callback, against the prospective state, before any value is committed. A violation returns an
+  unsuccessful `SetParametersResult`, nothing is applied, and the user callback does not run.
+
+Because the callback is invoked per set operation, enforcement is as atomic as the call that triggers it. Moving a
+coupled pair to a disjoint range has to be done in one request:
+
+```c++
+node->set_parameters_atomically({
+    rclcpp::Parameter("to_base.vel_min", 1.8),
+    rclcpp::Parameter("to_base.vel_max", 2.4),
+});
+```
+
+`set_parameters` and `ros2 param set` apply values one at a time, so setting one half of such a pair on its own is
+rejected.
+
+Constraints guard the parameter interface, not the generated struct. A `Params` copy obtained from `get_params()` can
+still be modified freely in your own code.
+
+#### Errors raised when generating
+Problems that can be detected from the YAML are reported by the generator rather than at runtime, including an unknown
+or mistyped parameter reference, an operand of the wrong type, a missing validation header for a custom function, and
+defaults that already violate a constraint:
+
+```
+ERROR: Constraint 'velocity_ordering' is violated by the declared default values: 2.0 < 1.6 is false.
+```
+
+A guard is also checked against a `one_of` validator on the parameter it references, so a guard comparing against a
+value outside the allowed set is reported instead of silently becoming unreachable. Requirements under a guard are only
+folded when the guard is active at the defaults, since an inactive guard makes the requirement vacuous.
+
+Constraints cannot reference parameters inside a `__map_` block. See [Mapped parameters](#mapped-parameters).
 
 ### Nested structures
 After the top-level key, every subsequent non-leaf key will generate a nested C++ struct. The struct instance will have
