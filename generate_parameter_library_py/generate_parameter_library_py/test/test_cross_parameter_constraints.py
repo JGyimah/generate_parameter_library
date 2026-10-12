@@ -42,7 +42,9 @@ from generate_parameter_library_py.parse_yaml import GenerateCode, YAMLSyntaxErr
 PARAMETERS = """to_base:
   navigation_mode:
     type: string
-    default_value: "autonomous"
+    default_value: "{nav_mode}"
+    validation:
+      one_of<>: [["autonomous", "manual"]]
   vel_min:
     type: double
     default_value: {vel_min}
@@ -64,11 +66,15 @@ PARAMETERS = """to_base:
 """
 
 
-def write_yaml(constraints, vel_min='0.5'):
+def write_yaml(constraints, vel_min='0.5', nav_mode='autonomous'):
     with tempfile.NamedTemporaryFile(
         mode='w', suffix='.yaml', delete=False
     ) as yaml_file:
-        yaml_file.write(PARAMETERS.format(constraints=constraints, vel_min=vel_min))
+        yaml_file.write(
+            PARAMETERS.format(
+                constraints=constraints, vel_min=vel_min, nav_mode=nav_mode
+            )
+        )
         return yaml_file.name
 
 
@@ -89,8 +95,8 @@ def generate(language, constraints, vel_min='0.5'):
         os.unlink(output_file)
 
 
-def parse_only(constraints, vel_min='0.5'):
-    yaml_file = write_yaml(constraints, vel_min)
+def parse_only(constraints, vel_min='0.5', nav_mode='autonomous'):
+    yaml_file = write_yaml(constraints, vel_min, nav_mode)
     try:
         GenerateCode('cpp').parse(yaml_file, '')
     finally:
@@ -140,9 +146,9 @@ def test_reference_resolves_from_enclosing_scope_then_root():
 
 
 def test_schema_without_constraints_is_unaffected():
-    yaml_without = PARAMETERS.format(constraints='', vel_min='0.5').replace(
-        '  __constraints:\n', ''
-    )
+    yaml_without = PARAMETERS.format(
+        constraints='', vel_min='0.5', nav_mode='autonomous'
+    ).replace('  __constraints:\n', '')
     with tempfile.NamedTemporaryFile(
         mode='w', suffix='.yaml', delete=False
     ) as yaml_file:
@@ -228,4 +234,104 @@ def test_schema_without_constraints_is_unaffected():
 def test_invalid_constraints_are_rejected(constraints, vel_min, expected):
     with pytest.raises(YAMLSyntaxError) as excinfo:
         parse_only(constraints, vel_min)
+    assert expected in str(excinfo.value)
+
+
+CONDITIONAL = """    manual_mode_speed_limit:
+      when:
+        eq: [$navigation_mode, "manual"]
+      require:
+        lt_eq: [$vel_max, 2.0]
+      description: "in manual mode, vel_max must not exceed 2.0"
+"""
+
+SHORTHAND = """    manual_mode_speed_limit:
+      when:
+        $navigation_mode: "manual"
+      require:
+        lt_eq: [$vel_max, 2.0]
+"""
+
+
+def test_cpp_conditional_nests_the_requirement_inside_the_guard():
+    code = generate('cpp', CONDITIONAL)
+    guard = 'if (updated_params.navigation_mode == "manual") {'
+    assert code.count(guard) == 2, 'expected a guard in update and declare'
+    body = code[code.index(guard) :]
+    assert body.index('if (!(updated_params.vel_max <= 2.0))') < body.index(
+        'tl::make_unexpected'
+    )
+    # the guard is named in the error so the active threshold is explained
+    assert "with navigation_mode == 'manual', vel_max ({}) must be <= 2.0" in code
+
+
+def test_python_conditional_generates_valid_module():
+    code = generate('python', CONDITIONAL)
+    ast.parse(code)
+    assert code.count('if updated_params.navigation_mode == "manual":') == 2
+    assert code.count('if not (updated_params.vel_max <= 2.0):') == 2
+
+
+def test_guard_shorthand_matches_the_explicit_form():
+    # description does not reach the generated code, so the two must be identical
+    assert generate('cpp', SHORTHAND) == generate('cpp', CONDITIONAL)
+
+
+def test_inactive_guard_makes_the_requirement_vacuous_at_defaults():
+    # navigation_mode defaults to autonomous, so the requirement cannot be
+    # folded even though vel_max (1.6) would violate it under manual mode
+    parse_only(
+        '    c:\n      when:\n        $navigation_mode: "manual"\n'
+        '      require:\n        lt_eq: [$vel_max, 1.0]\n'
+    )
+
+
+def test_active_guard_folds_the_requirement_at_defaults():
+    with pytest.raises(YAMLSyntaxError) as excinfo:
+        parse_only(
+            '    c:\n      when:\n        $navigation_mode: "manual"\n'
+            '      require:\n        lt_eq: [$vel_max, 1.0]\n',
+            nav_mode='manual',
+        )
+    assert 'violated by the declared default values' in str(excinfo.value)
+    assert "with navigation_mode == 'manual'" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ('constraints', 'expected'),
+    [
+        (
+            '    bad:\n      when:\n        $navigation_mode: "manual"\n',
+            "has 'when' without 'require'",
+        ),
+        (
+            '    bad:\n      require:\n        lt: [$vel_min, $vel_max]\n',
+            "has 'require' without 'when'",
+        ),
+        (
+            '    bad:\n      lt: [$vel_min, $vel_max]\n      when:\n'
+            '        $navigation_mode: "manual"\n      require:\n'
+            '        lt_eq: [$vel_max, 2.0]\n',
+            'mixes',
+        ),
+        (
+            '    bad:\n      when:\n        $navigation_mode: "teleop"\n'
+            '      require:\n        lt_eq: [$vel_max, 2.0]\n',
+            'can never be true',
+        ),
+        (
+            '    bad:\n      when:\n        navigation_mode: "manual"\n'
+            '      require:\n        lt_eq: [$vel_max, 2.0]\n',
+            "unknown operator 'navigation_mode' in 'when'",
+        ),
+        (
+            '    bad:\n      when:\n        eq: [$navigation_mode, "manual"]\n'
+            '      require:\n        lt_eq: [$vel_max]\n',
+            'takes exactly 2 operands',
+        ),
+    ],
+)
+def test_invalid_conditional_constraints_are_rejected(constraints, expected):
+    with pytest.raises(YAMLSyntaxError) as excinfo:
+        parse_only(constraints)
     assert expected in str(excinfo.value)

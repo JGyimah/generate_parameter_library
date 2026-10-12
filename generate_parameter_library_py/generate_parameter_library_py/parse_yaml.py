@@ -108,7 +108,10 @@ def validation_base_name(function_name: str):
 CONSTRAINTS_KEY = '__constraints'
 
 # Keys allowed alongside the operator inside a single constraint definition
-CONSTRAINT_RESERVED_KEYS = {'description'}
+CONSTRAINT_RESERVED_KEYS = {'description', 'when', 'require'}
+
+# Keys forming the conditional (guarded) constraint form
+CONSTRAINT_CONDITIONAL_KEYS = {'when', 'require'}
 
 # Built-in cross-parameter relations. These are emitted as inline comparisons,
 # so one operator string serves both C++ and Python.
@@ -587,56 +590,117 @@ class ConstraintOperand:
         """The argument feeding this operand's placeholder, if it has one."""
         return self.code() if self.is_reference() else None
 
+    @typechecked
+    def label(self) -> str:
+        """Static text for this operand, with no runtime placeholder."""
+        if self.is_reference():
+            return self.param_path
+        if isinstance(self.value, bool):
+            return str(self.value).lower()
+        if isinstance(self.value, str):
+            return "'{}'".format(self.value)
+        return str(self.value)
 
-class ParameterConstraint:
-    """A constraint relating several parameters, checked once per struct."""
+
+class ConstraintRelation:
+    """A single comparison between two operands."""
 
     @typechecked
-    def __init__(
-        self,
-        name: str,
-        operator: str,
-        operands: List[ConstraintOperand],
-        description: str,
-        conversion,
-        invalid_effect_func,
-        context: str = '',
-    ):
-        self.name = name
+    def __init__(self, operator: str, operands: List[ConstraintOperand]):
         self.operator = operator
         self.operands = operands
-        self.description = description
-        self.conversion = conversion
-        self.invalid_effect_func = invalid_effect_func
-        self.context = context
 
     @typechecked
-    def condition(self) -> str:
+    def code(self) -> str:
         lhs, rhs = self.operands
         return '{} {} {}'.format(
             lhs.code(), BUILTIN_CONSTRAINTS[self.operator], rhs.code()
         )
 
     @typechecked
-    def message(self) -> str:
+    def describe(self) -> str:
+        """Text with a format placeholder for every parameter reference."""
         lhs, rhs = self.operands
-        text = "{}Constraint '{}' violated: {} must be {} {}".format(
-            self.context,
-            self.name,
-            lhs.describe(),
-            BUILTIN_CONSTRAINTS[self.operator],
-            rhs.describe(),
+        return '{} must be {} {}'.format(
+            lhs.describe(), BUILTIN_CONSTRAINTS[self.operator], rhs.describe()
         )
-        args = [op.format_arg() for op in self.operands if op.format_arg()]
-        return self.conversion.constraint_message(text, args)
+
+    @typechecked
+    def label(self) -> str:
+        """Static text with no placeholders, used to describe a guard."""
+        lhs, rhs = self.operands
+        return '{} {} {}'.format(
+            lhs.label(), BUILTIN_CONSTRAINTS[self.operator], rhs.label()
+        )
+
+    @typechecked
+    def format_args(self) -> List[str]:
+        return [op.format_arg() for op in self.operands if op.format_arg()]
+
+    @typechecked
+    def evaluate(self) -> Union[None, bool]:
+        """Fold against declared defaults; None when a value is unknown."""
+        if not all(op.value_known and op.value is not None for op in self.operands):
+            return None
+        lhs, rhs = (op.value for op in self.operands)
+        return {
+            'lt': lhs < rhs,
+            'lt_eq': lhs <= rhs,
+            'gt': lhs > rhs,
+            'gt_eq': lhs >= rhs,
+            'eq': lhs == rhs,
+            'ne': lhs != rhs,
+        }[self.operator]
+
+
+class ParameterConstraint:
+    """A constraint relating several parameters, checked once per struct.
+
+    Unconditional constraints hold at all times. A conditional constraint
+    carries a guard and is only required to hold while that guard is true.
+    """
+
+    @typechecked
+    def __init__(
+        self,
+        name: str,
+        require: ConstraintRelation,
+        description: str,
+        conversion,
+        invalid_effect_func,
+        context: str = '',
+        guard: Union[None, ConstraintRelation] = None,
+    ):
+        self.name = name
+        self.require = require
+        self.description = description
+        self.conversion = conversion
+        self.invalid_effect_func = invalid_effect_func
+        self.context = context
+        self.guard = guard
+
+    @typechecked
+    def message(self) -> str:
+        condition = ''
+        if self.guard is not None:
+            condition = 'with {}, '.format(self.guard.label())
+        text = "{}Constraint '{}' violated: {}{}".format(
+            self.context, self.name, condition, self.require.describe()
+        )
+        return self.conversion.constraint_message(text, self.require.format_args())
 
     def __str__(self):
-        data = {
-            'condition': self.condition(),
-            'invalid_effect': self.invalid_effect_func(self.message()),
-        }
-        j2_template = Template(GenerateCode.templates['parameter_constraint'])
-        return j2_template.render(data, trim_blocks=True)
+        check = Template(GenerateCode.templates['parameter_constraint']).render(
+            {
+                'condition': self.require.code(),
+                'invalid_effect': self.invalid_effect_func(self.message()),
+            }
+        )
+        if self.guard is None:
+            return check
+        return Template(
+            GenerateCode.templates['parameter_constraint_conditional']
+        ).render({'guard': self.guard.code(), 'body': check})
 
 
 class UpdateParameterBase:
@@ -1105,10 +1169,17 @@ class GenerateCode:
             )
         else:
             self.declared_param_names.add(param_name)
-            self.declared_param_info[param_name] = (
-                code_gen_variable.defined_type,
-                code_gen_variable.default_value,
-            )
+            one_of_values = None
+            for validation in validations:
+                if validation.function_base_name == 'one_of' and validation.arguments:
+                    candidate = validation.arguments[0]
+                    if isinstance(candidate, list):
+                        one_of_values = candidate
+            self.declared_param_info[param_name] = {
+                'type': code_gen_variable.defined_type,
+                'default': code_gen_variable.default_value,
+                'one_of': one_of_values,
+            }
 
         if is_runtime_parameter:
             declare_parameter_set = SetRuntimeParameter(param_name, code_gen_variable)
@@ -1241,14 +1312,14 @@ class GenerateCode:
     def build_operand(self, raw: Any, scope: str, constraint_name: str, operator: str):
         if is_parameter_reference(raw):
             path = self.resolve_reference(raw, scope, constraint_name)
-            defined_type, default_value = self.declared_param_info[path]
-            self.check_operand_type(defined_type, constraint_name, operator, path)
+            info = self.declared_param_info[path]
+            self.check_operand_type(info['type'], constraint_name, operator, path)
             return ConstraintOperand(
                 self.conversion,
-                defined_type,
+                info['type'],
                 param_path=path,
-                value=default_value,
-                value_known=default_value is not None,
+                value=info['default'],
+                value_known=info['default'] is not None,
             )
 
         defined_type = literal_type(raw)
@@ -1287,74 +1358,164 @@ class GenerateCode:
             )
 
     @typechecked
-    def fold_constraint_defaults(self, constraint_name: str, operator: str, operands):
-        """Reject a constraint that is already violated by the declared defaults."""
-        if not all(op.value_known and op.value is not None for op in operands):
-            return
-        lhs, rhs = (op.value for op in operands)
-        checks = {
-            'lt': lhs < rhs,
-            'lt_eq': lhs <= rhs,
-            'gt': lhs > rhs,
-            'gt_eq': lhs >= rhs,
-            'eq': lhs == rhs,
-            'ne': lhs != rhs,
-        }
-        if not checks[operator]:
+    def parse_relation(
+        self, spec: Any, scope: str, constraint_name: str, what: str
+    ) -> ConstraintRelation:
+        """Parse a single ``{operator: [operand, operand]}`` mapping."""
+        if not isinstance(spec, dict):
             raise compile_error(
-                "Constraint '{}' is violated by the declared default values: "
-                '{} {} {} is false.'.format(
-                    constraint_name, lhs, BUILTIN_CONSTRAINTS[operator], rhs
+                "Constraint '{}' has an invalid '{}': expected a mapping such as "
+                "'lt: [$a, $b]'.".format(constraint_name, what)
+            )
+        operators = [k for k in spec if k not in CONSTRAINT_RESERVED_KEYS]
+        if len(operators) != 1:
+            raise compile_error(
+                "Constraint '{}' must contain exactly one operator in '{}', "
+                'found {}.'.format(constraint_name, what, len(operators))
+            )
+        operator = operators[0]
+        if isinstance(operator, str) and operator.endswith('<>'):
+            raise compile_error(
+                "Constraint '{}' uses '{}'. The '<>' suffix is only for "
+                'per-parameter validators; constraints are not templated.'.format(
+                    constraint_name, operator
                 )
             )
+        if operator not in BUILTIN_CONSTRAINTS:
+            raise compile_error(
+                "Constraint '{}' uses unknown operator '{}' in '{}'. Supported "
+                'operators are: {}.'.format(
+                    constraint_name,
+                    operator,
+                    what,
+                    ', '.join(sorted(BUILTIN_CONSTRAINTS)),
+                )
+            )
+
+        raw_operands = spec[operator]
+        if not isinstance(raw_operands, list) or len(raw_operands) != 2:
+            raise compile_error(
+                "Constraint '{}' with operator '{}' takes exactly 2 operands, "
+                'e.g. [$vel_min, $vel_max].'.format(constraint_name, operator)
+            )
+
+        operands = [
+            self.build_operand(raw, scope, constraint_name, operator)
+            for raw in raw_operands
+        ]
+        if not any(op.is_reference() for op in operands):
+            raise compile_error(
+                "Constraint '{}' has a '{}' that does not reference any parameter. "
+                'At least one operand must be a $reference.'.format(
+                    constraint_name, what
+                )
+            )
+        return ConstraintRelation(operator, operands)
+
+    @typechecked
+    def parse_guard(
+        self, spec: Any, scope: str, constraint_name: str
+    ) -> ConstraintRelation:
+        """Parse a 'when' guard, accepting the ``{$param: value}`` shorthand."""
+        if isinstance(spec, dict) and len(spec) == 1:
+            key = next(iter(spec))
+            if is_parameter_reference(key):
+                spec = {'eq': [key, spec[key]]}
+        guard = self.parse_relation(spec, scope, constraint_name, 'when')
+        self.check_guard_reachable(guard, constraint_name)
+        return guard
+
+    @typechecked
+    def check_guard_reachable(
+        self, guard: ConstraintRelation, constraint_name: str
+    ) -> None:
+        """Reject a guard that a one_of validator makes impossible."""
+        if guard.operator != 'eq':
+            return
+        references = [op for op in guard.operands if op.is_reference()]
+        literals = [op for op in guard.operands if not op.is_reference()]
+        if len(references) != 1 or len(literals) != 1:
+            return
+        allowed = self.declared_param_info[references[0].param_path]['one_of']
+        if allowed is None or literals[0].value in allowed:
+            return
+        raise compile_error(
+            "Constraint '{}' has a 'when' guard that can never be true: "
+            "'{}' is not one of the values allowed for {} ({}).".format(
+                constraint_name,
+                literals[0].value,
+                references[0].param_path,
+                ', '.join(str(v) for v in allowed),
+            )
+        )
+
+    @typechecked
+    def fold_constraint_defaults(
+        self,
+        constraint_name: str,
+        require: ConstraintRelation,
+        guard: Union[None, ConstraintRelation],
+    ) -> None:
+        """Reject a constraint that the declared defaults already violate.
+
+        A guarded constraint is only folded when the guard is provably active
+        at the defaults; an inactive guard makes the requirement vacuous.
+        """
+        if guard is not None and guard.evaluate() is not True:
+            return
+        if require.evaluate() is not False:
+            return
+        lhs, rhs = (op.value for op in require.operands)
+        condition = ''
+        if guard is not None:
+            condition = 'with {}, '.format(guard.label())
+        raise compile_error(
+            "Constraint '{}' is violated by the declared default values: "
+            '{}{} {} {} is false.'.format(
+                constraint_name,
+                condition,
+                lhs,
+                BUILTIN_CONSTRAINTS[require.operator],
+                rhs,
+            )
+        )
 
     @typechecked
     def resolve_constraints(self) -> None:
         for scope, constraint_name, spec in self.collected_constraints:
             description = spec.get('description', '')
+            conditional_keys = CONSTRAINT_CONDITIONAL_KEYS.intersection(spec)
             operators = [k for k in spec if k not in CONSTRAINT_RESERVED_KEYS]
-            if len(operators) != 1:
-                raise compile_error(
-                    "Constraint '{}' must contain exactly one operator, found {}.".format(
-                        constraint_name, len(operators)
+
+            if conditional_keys:
+                if operators:
+                    raise compile_error(
+                        "Constraint '{}' mixes '{}' with the conditional "
+                        "'when'/'require' form. Use one or the other.".format(
+                            constraint_name, operators[0]
+                        )
                     )
+                missing = CONSTRAINT_CONDITIONAL_KEYS - conditional_keys
+                if missing:
+                    raise compile_error(
+                        "Constraint '{}' has '{}' without '{}'. The conditional "
+                        'form needs both.'.format(
+                            constraint_name,
+                            next(iter(conditional_keys)),
+                            next(iter(missing)),
+                        )
+                    )
+                guard = self.parse_guard(spec['when'], scope, constraint_name)
+                require = self.parse_relation(
+                    spec['require'], scope, constraint_name, 'require'
                 )
-            operator = operators[0]
-            if operator.endswith('<>'):
-                raise compile_error(
-                    "Constraint '{}' uses '{}'. The '<>' suffix is only for "
-                    'per-parameter validators; constraints are not templated.'.format(
-                        constraint_name, operator
-                    )
-                )
-            if operator not in BUILTIN_CONSTRAINTS:
-                raise compile_error(
-                    "Constraint '{}' uses unknown operator '{}'. Supported "
-                    'operators are: {}.'.format(
-                        constraint_name,
-                        operator,
-                        ', '.join(sorted(BUILTIN_CONSTRAINTS)),
-                    )
+            else:
+                guard = None
+                require = self.parse_relation(
+                    spec, scope, constraint_name, CONSTRAINTS_KEY
                 )
 
-            raw_operands = spec[operator]
-            if not isinstance(raw_operands, list) or len(raw_operands) != 2:
-                raise compile_error(
-                    "Constraint '{}' with operator '{}' takes exactly 2 operands, "
-                    'e.g. [$vel_min, $vel_max].'.format(constraint_name, operator)
-                )
-
-            operands = [
-                self.build_operand(raw, scope, constraint_name, operator)
-                for raw in raw_operands
-            ]
-            if not any(op.is_reference() for op in operands):
-                raise compile_error(
-                    "Constraint '{}' does not reference any parameter. At least one "
-                    'operand must be a $reference.'.format(constraint_name)
-                )
-
-            self.fold_constraint_defaults(constraint_name, operator, operands)
+            self.fold_constraint_defaults(constraint_name, require, guard)
 
             # markdown and rst reuse this parser for documentation only
             if self.language not in {'cpp', 'python'}:
@@ -1363,22 +1524,22 @@ class GenerateCode:
             self.update_constraints.append(
                 ParameterConstraint(
                     constraint_name,
-                    operator,
-                    operands,
+                    require,
                     description,
                     self.conversion,
                     self.conversion.constraint_fail_update,
+                    guard=guard,
                 )
             )
             self.declare_constraints.append(
                 ParameterConstraint(
                     constraint_name,
-                    operator,
-                    operands,
+                    require,
                     description,
                     self.conversion,
                     self.conversion.constraint_fail_init,
                     'Invalid values set during initialization: ',
+                    guard=guard,
                 )
             )
 

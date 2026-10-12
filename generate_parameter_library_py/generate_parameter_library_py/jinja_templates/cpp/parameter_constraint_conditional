@@ -1,0 +1,5 @@
+if ({{guard}}) {
+{%- filter indent(width=4) %}
+{{body}}
+{% endfilter -%}
+}
