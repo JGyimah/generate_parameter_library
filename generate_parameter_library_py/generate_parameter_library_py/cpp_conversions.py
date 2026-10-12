@@ -143,6 +143,14 @@ class CPPConversions:
         return 'fmt::format("{}", {})'.format(text, ', '.join(args))
 
     @typechecked
+    def constraint_function_name(self, function_name: str) -> str:
+        return function_name
+
+    @typechecked
+    def constraint_custom_message(self, prefix: str) -> str:
+        return 'fmt::format("{}{{}}", validation_result.error())'.format(prefix)
+
+    @typechecked
     def constraint_fail_update(self, message: str) -> str:
         return 'return rsl::to_parameter_result_msg(tl::make_unexpected({}));'.format(
             message

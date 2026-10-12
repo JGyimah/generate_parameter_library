@@ -78,16 +78,16 @@ def write_yaml(constraints, vel_min='0.5', nav_mode='autonomous'):
         return yaml_file.name
 
 
-def generate(language, constraints, vel_min='0.5'):
+def generate(language, constraints, vel_min='0.5', header=''):
     yaml_file = write_yaml(constraints, vel_min)
     suffix = '.hpp' if language == 'cpp' else '.py'
     with tempfile.NamedTemporaryFile(mode='w', suffix=suffix, delete=False) as out:
         output_file = out.name
     try:
         if language == 'cpp':
-            run_cpp(output_file, yaml_file)
+            run_cpp(output_file, yaml_file, header)
         else:
-            run_python(output_file, yaml_file)
+            run_python(output_file, yaml_file, header)
         with open(output_file) as f:
             return f.read()
     finally:
@@ -95,10 +95,10 @@ def generate(language, constraints, vel_min='0.5'):
         os.unlink(output_file)
 
 
-def parse_only(constraints, vel_min='0.5', nav_mode='autonomous'):
+def parse_only(constraints, vel_min='0.5', nav_mode='autonomous', header=''):
     yaml_file = write_yaml(constraints, vel_min, nav_mode)
     try:
-        GenerateCode('cpp').parse(yaml_file, '')
+        GenerateCode('cpp').parse(yaml_file, header)
     finally:
         os.unlink(yaml_file)
 
@@ -335,3 +335,106 @@ def test_invalid_conditional_constraints_are_rejected(constraints, expected):
     with pytest.raises(YAMLSyntaxError) as excinfo:
         parse_only(constraints)
     assert expected in str(excinfo.value)
+
+
+CUSTOM = """    srdf_matches_urdf:
+      "my_project::srdf_matches_urdf": [$navigation_mode, $joints, 0.25]
+      description: "an arbitrary predicate over several parameters"
+"""
+
+HEADER = 'my_project/validators.hpp'
+
+
+def test_cpp_custom_constraint_calls_the_user_function():
+    code = generate('cpp', CUSTOM, header=HEADER)
+    call = (
+        'my_project::srdf_matches_urdf(updated_params.navigation_mode, '
+        'updated_params.joints, 0.25)'
+    )
+    assert code.count(call) == 2, 'expected a call in update and declare'
+    # the user function supplies the message body
+    assert (
+        'fmt::format("Constraint \'srdf_matches_urdf\' violated: {}", '
+        'validation_result.error())' in code
+    )
+
+
+def test_custom_constraint_accepts_array_and_string_operands():
+    # arrays are rejected for built-in relations but are the point of a
+    # custom predicate, so only references escape the scalar restriction
+    code = generate('cpp', CUSTOM, header=HEADER)
+    assert 'updated_params.joints' in code
+
+
+def test_python_custom_constraint_uses_the_import_alias():
+    constraints = '    c:\n      "custom_validators::check": [$vel_min, $vel_max]\n'
+    code = generate('python', constraints, header='my_project.validators')
+    ast.parse(code)
+    assert code.count('custom_validators.check(') == 2
+    assert "\"Constraint 'c' violated: \" + validation_result" in code
+
+
+def test_custom_constraint_may_be_guarded():
+    constraints = (
+        '    c:\n      when:\n        $navigation_mode: "manual"\n'
+        '      require:\n        "my_project::check": [$vel_max]\n'
+    )
+    code = generate('cpp', constraints, header=HEADER)
+    guard = 'if (updated_params.navigation_mode == "manual") {'
+    body = code[code.index(guard) :]
+    assert body.index('my_project::check(updated_params.vel_max)') < body.index(
+        'tl::make_unexpected'
+    )
+    assert "with navigation_mode == 'manual'" in code
+
+
+def test_custom_constraint_is_not_folded_against_defaults():
+    # vel_max would violate a built-in lt_eq here, but a predicate is opaque
+    parse_only('    c:\n      "my_project::check": [$vel_max, 1.0]\n', header=HEADER)
+
+
+@pytest.mark.parametrize(
+    ('constraints', 'header', 'expected'),
+    [
+        (
+            '    bad:\n      "my_project::check": [$vel_min]\n',
+            '',
+            'no validation header was given',
+        ),
+        (
+            '    bad:\n      "my_project::check": []\n',
+            HEADER,
+            'with no operands',
+        ),
+        (
+            '    bad:\n      "my_project::check": [1.0, 2.0]\n',
+            HEADER,
+            'without referencing any parameter',
+        ),
+        (
+            '    bad:\n      when:\n        "my_project::check": [$vel_min]\n'
+            '      require:\n        lt: [$vel_min, $vel_max]\n',
+            HEADER,
+            'can only be used as the requirement',
+        ),
+        (
+            '    bad:\n      not_qualified: [$vel_min, $vel_max]\n',
+            HEADER,
+            'must be fully qualified',
+        ),
+    ],
+)
+def test_invalid_custom_constraints_are_rejected(constraints, header, expected):
+    with pytest.raises(YAMLSyntaxError) as excinfo:
+        parse_only(constraints, header=header)
+    assert expected in str(excinfo.value)
+
+
+def test_python_rejects_a_namespace_other_than_the_import_alias():
+    yaml_file = write_yaml('    c:\n      "my_project::check": [$vel_min]\n')
+    try:
+        with pytest.raises(YAMLSyntaxError) as excinfo:
+            GenerateCode('python').parse(yaml_file, 'my_project.validators')
+        assert "must be qualified with 'custom_validators::'" in str(excinfo.value)
+    finally:
+        os.unlink(yaml_file)

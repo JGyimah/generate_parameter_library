@@ -132,6 +132,9 @@ EQUALITY_TYPES = NUMERIC_TYPES | {'string', 'bool'}
 
 CONSTRAINT_NAME_PATTERN = re.compile(r'^[a-z][a-z0-9_]*$')
 
+# the alias the generated python module imports the user validation file under
+PYTHON_VALIDATOR_NAMESPACE = 'custom_validators'
+
 
 @typechecked
 def is_parameter_reference(value: Any):
@@ -653,6 +656,35 @@ class ConstraintRelation:
         }[self.operator]
 
 
+class ConstraintCall:
+    """A call to a user-supplied function relating several parameters.
+
+    Operands are passed positionally by value, so the function's signature is
+    checked by the host language's compiler and the generator knows exactly
+    which parameters take part.
+    """
+
+    @typechecked
+    def __init__(
+        self, function_name: str, operands: List[ConstraintOperand], conversion
+    ):
+        self.function_name = function_name
+        self.operands = operands
+        self.conversion = conversion
+
+    @typechecked
+    def code(self) -> str:
+        return '{}({})'.format(
+            self.conversion.constraint_function_name(self.function_name),
+            ', '.join(op.code() for op in self.operands),
+        )
+
+    @typechecked
+    def evaluate(self) -> Union[None, bool]:
+        # an arbitrary predicate cannot be folded at generation time
+        return None
+
+
 class ParameterConstraint:
     """A constraint relating several parameters, checked once per struct.
 
@@ -664,7 +696,7 @@ class ParameterConstraint:
     def __init__(
         self,
         name: str,
-        require: ConstraintRelation,
+        require: Union[ConstraintRelation, ConstraintCall],
         description: str,
         conversion,
         invalid_effect_func,
@@ -680,22 +712,35 @@ class ParameterConstraint:
         self.guard = guard
 
     @typechecked
-    def message(self) -> str:
+    def prefix(self) -> str:
         condition = ''
         if self.guard is not None:
             condition = 'with {}, '.format(self.guard.label())
-        text = "{}Constraint '{}' violated: {}{}".format(
-            self.context, self.name, condition, self.require.describe()
+        return "{}Constraint '{}' violated: {}".format(
+            self.context, self.name, condition
         )
+
+    @typechecked
+    def message(self) -> str:
+        if isinstance(self.require, ConstraintCall):
+            # the user function supplies the substance of the message
+            return self.conversion.constraint_custom_message(self.prefix())
+        text = self.prefix() + self.require.describe()
         return self.conversion.constraint_message(text, self.require.format_args())
 
     def __str__(self):
-        check = Template(GenerateCode.templates['parameter_constraint']).render(
-            {
-                'condition': self.require.code(),
-                'invalid_effect': self.invalid_effect_func(self.message()),
-            }
-        )
+        invalid_effect = self.invalid_effect_func(self.message())
+        if isinstance(self.require, ConstraintCall):
+            check = Template(
+                GenerateCode.templates['parameter_constraint_custom']
+            ).render({'call': self.require.code(), 'invalid_effect': invalid_effect})
+        else:
+            check = Template(GenerateCode.templates['parameter_constraint']).render(
+                {
+                    'condition': self.require.code(),
+                    'invalid_effect': invalid_effect,
+                }
+            )
         if self.guard is None:
             return check
         return Template(
@@ -1102,6 +1147,7 @@ class GenerateCode:
         self.collected_constraints = []
         self.update_constraints = []
         self.declare_constraints = []
+        self.custom_constraints_used = False
 
     def parse(self, yaml_file, validate_header):
         with open(yaml_file) as f:
@@ -1309,11 +1355,19 @@ class GenerateCode:
         )
 
     @typechecked
-    def build_operand(self, raw: Any, scope: str, constraint_name: str, operator: str):
+    def build_operand(
+        self,
+        raw: Any,
+        scope: str,
+        constraint_name: str,
+        operator: str,
+        custom: bool = False,
+    ):
         if is_parameter_reference(raw):
             path = self.resolve_reference(raw, scope, constraint_name)
             info = self.declared_param_info[path]
-            self.check_operand_type(info['type'], constraint_name, operator, path)
+            if not custom:
+                self.check_operand_type(info['type'], constraint_name, operator, path)
             return ConstraintOperand(
                 self.conversion,
                 info['type'],
@@ -1330,7 +1384,8 @@ class GenerateCode:
                     constraint_name, raw
                 )
             )
-        self.check_operand_type(defined_type, constraint_name, operator, repr(raw))
+        if not custom:
+            self.check_operand_type(defined_type, constraint_name, operator, repr(raw))
         return ConstraintOperand(self.conversion, defined_type, value=raw)
 
     @typechecked
@@ -1359,8 +1414,13 @@ class GenerateCode:
 
     @typechecked
     def parse_relation(
-        self, spec: Any, scope: str, constraint_name: str, what: str
-    ) -> ConstraintRelation:
+        self,
+        spec: Any,
+        scope: str,
+        constraint_name: str,
+        what: str,
+        allow_custom: bool = True,
+    ) -> Union[ConstraintRelation, ConstraintCall]:
         """Parse a single ``{operator: [operand, operand]}`` mapping."""
         if not isinstance(spec, dict):
             raise compile_error(
@@ -1382,9 +1442,22 @@ class GenerateCode:
                 )
             )
         if operator not in BUILTIN_CONSTRAINTS:
+            if isinstance(operator, str) and '::' in operator:
+                if not allow_custom:
+                    raise compile_error(
+                        "Constraint '{}' uses the custom function '{}' in '{}'. "
+                        'Custom functions return a validation result rather than a '
+                        'boolean, so they can only be used as the requirement.'.format(
+                            constraint_name, operator, what
+                        )
+                    )
+                return self.parse_custom_call(
+                    operator, spec[operator], scope, constraint_name
+                )
             raise compile_error(
                 "Constraint '{}' uses unknown operator '{}' in '{}'. Supported "
-                'operators are: {}.'.format(
+                'operators are: {}. A custom function must be fully qualified, '
+                "e.g. 'my_project::my_check'.".format(
                     constraint_name,
                     operator,
                     what,
@@ -1413,6 +1486,42 @@ class GenerateCode:
         return ConstraintRelation(operator, operands)
 
     @typechecked
+    def parse_custom_call(
+        self, function_name: str, raw_operands: Any, scope: str, constraint_name: str
+    ) -> ConstraintCall:
+        if not isinstance(raw_operands, list) or not raw_operands:
+            raise compile_error(
+                "Constraint '{}' calls '{}' with no operands. A custom constraint "
+                'takes a list of operands, at least one of which is a '
+                '$reference.'.format(constraint_name, function_name)
+            )
+        operands = [
+            self.build_operand(raw, scope, constraint_name, function_name, custom=True)
+            for raw in raw_operands
+        ]
+        if not any(op.is_reference() for op in operands):
+            raise compile_error(
+                "Constraint '{}' calls '{}' without referencing any parameter. "
+                'At least one operand must be a $reference.'.format(
+                    constraint_name, function_name
+                )
+            )
+        # the python template imports the validation module under a fixed alias,
+        # so any other namespace would be a NameError at runtime
+        if self.language == 'python' and not function_name.startswith(
+            PYTHON_VALIDATOR_NAMESPACE + '::'
+        ):
+            raise compile_error(
+                "Constraint '{}' calls '{}'. For python targets a custom function "
+                "must be qualified with '{}::', which is the alias the generated "
+                'module imports the validation file under.'.format(
+                    constraint_name, function_name, PYTHON_VALIDATOR_NAMESPACE
+                )
+            )
+        self.custom_constraints_used = True
+        return ConstraintCall(function_name, operands, self.conversion)
+
+    @typechecked
     def parse_guard(
         self, spec: Any, scope: str, constraint_name: str
     ) -> ConstraintRelation:
@@ -1421,7 +1530,9 @@ class GenerateCode:
             key = next(iter(spec))
             if is_parameter_reference(key):
                 spec = {'eq': [key, spec[key]]}
-        guard = self.parse_relation(spec, scope, constraint_name, 'when')
+        guard = self.parse_relation(
+            spec, scope, constraint_name, 'when', allow_custom=False
+        )
         self.check_guard_reachable(guard, constraint_name)
         return guard
 
@@ -1453,7 +1564,7 @@ class GenerateCode:
     def fold_constraint_defaults(
         self,
         constraint_name: str,
-        require: ConstraintRelation,
+        require: Union[ConstraintRelation, ConstraintCall],
         guard: Union[None, ConstraintRelation],
     ) -> None:
         """Reject a constraint that the declared defaults already violate.
@@ -1541,6 +1652,19 @@ class GenerateCode:
                     'Invalid values set during initialization: ',
                     guard=guard,
                 )
+            )
+
+        # a custom constraint calls into the user's validation header, so the
+        # generated code cannot compile without it
+        if (
+            self.custom_constraints_used
+            and self.language in {'cpp', 'python'}
+            and not self.user_validation_file
+        ):
+            raise compile_error(
+                'A constraint calls a custom function, but no validation header '
+                'was given to the generator. Pass one as the third argument to '
+                'generate_parameter_library().'
             )
 
     def parse_dict(self, name, root_map, nested_name):

@@ -142,6 +142,14 @@ class PythonConversions:
         return '"{}".format({})'.format(text, ', '.join(args))
 
     @typechecked
+    def constraint_function_name(self, function_name: str) -> str:
+        return function_name.replace('::', '.')
+
+    @typechecked
+    def constraint_custom_message(self, prefix: str) -> str:
+        return '"{}" + validation_result'.format(prefix)
+
+    @typechecked
     def constraint_fail_update(self, message: str) -> str:
         return 'return SetParametersResult(successful=False, reason={})'.format(message)
 

@@ -1,0 +1,6 @@
+if (auto validation_result = {{call}};
+  !validation_result) {
+{%- filter indent(width=4) %}
+{{invalid_effect}}
+{% endfilter -%}
+}
